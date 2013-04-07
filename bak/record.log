@@ -1,0 +1,18 @@
+(gdb) where
+#0  0x00000002 in ?? ()
+#1  0x0805156f in ccn_age_interest (h=0x8f0d660, interest=0xb6404238, key=0xb6404134 "\372\325transition", keysize=256)
+    at ccn_client.c:1747
+#2  0x08051913 in ccn_process_scheduled_operations (h=0x8f0d660) at ccn_client.c:1870
+#3  0x08051aab in ccn_run (h=0x8f0d660, timeout=3000) at ccn_client.c:1935
+#4  0x08051f21 in ccn_get (h=0x8f0d660, name=0xb6e049c0, interest_template=0x0, timeout_ms=3000, resultbuf=0xb6e060e8, 
+    pcobuf=0xb770ba54, compsbuf=0x0, flags=0) at ccn_client.c:2098
+#5  0x0804b066 in ts_get (lccn_h=0x8f0d660, resultbuf=0xb6e060e8, 
+    uri=0xb770becc "ccnx:/transition/21c810c4/73a07bc1/674c1ad3/11c386ca", pcobuf=0xb770ba54, timeout=-1) at transition.cpp:481
+#6  0x0804b68f in incoming_interest (selfp=0xbf8dffa0, kind=CCN_UPCALL_INTEREST, info=0xb771c1b0) at transition.cpp:724
+#7  0x08050c77 in ccn_dispatch_message (h=0x8f0e7f0, msg=0xb6e00650 "\001\322\362\372\325transition", size=285)
+    at ccn_client.c:1539
+#8  0x080511f1 in ccn_process_input (h=0x8f0e7f0) at ccn_client.c:1663
+#9  0x08051c06 in ccn_run (h=0x8f0e7f0, timeout=-1) at ccn_client.c:1965
+#10 0x0804b0de in ts_ccn_wait () at transition.cpp:505
+#11 0x41a15adf in start_thread () from /lib/libpthread.so.0
+#12 0x4195054e in clone () from /lib/libc.so.6

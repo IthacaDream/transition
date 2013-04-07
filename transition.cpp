@@ -1,0 +1,1478 @@
+/**
+ * This is a CCN tunnel program. It receives packets from applications via
+ * a tun device, forwards them to a remote endpoint via CCN
+ *
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <net/ethernet.h>
+#include <time.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <assert.h>
+
+extern "C"
+{
+#include <ccn/ccn.h>
+#include <ccn/ccn_private.h>
+#include <ccn/ccnd.h>
+#include <ccn/bloom.h>
+#include <ccn/charbuf.h>
+#include <ccn/coding.h>
+#include <ccn/digest.h>
+#include <ccn/hashtb.h>
+#include <ccn/reg_mgmt.h>
+#include <ccn/schedule.h>
+#include <ccn/signing.h>
+#include <ccn/keystore.h>
+#include <ccn/uri.h>
+}
+
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cctype>
+
+#ifdef MLOG
+#include <log4cpp/Category.hh>
+#include <log4cpp/PropertyConfigurator.hh>
+#endif
+
+#include "config.h"
+#include "md5.h"
+#include "transition.h"
+
+
+char uri_prefix[URI_PREFIX_MAX_LEN];
+
+//struct ccn* ccnh_workers[MAX_RDR_THREADS];
+struct ccn* ccnh_workers;
+int free_worker_ids[MAX_RDR_THREADS];     // not a good way
+
+pthread_mutex_t g_mutex;
+
+int tun_fd;
+int g_packet_count;
+int g_log_id;
+
+struct settings g_setting;
+
+#ifdef MLOG
+log4cpp::Category *log;            // logging
+#endif
+
+FILE* DF = -1;
+int g_seq;
+/* @describe: shutdown log before exit
+ * @param:    rc
+ */
+void safe_exit(int rc) {
+#ifdef MLOG
+  log4cpp::Category::shutdown();
+#endif
+  if ( DF != -1)
+    close (DF);
+  exit(rc);
+}
+
+/* TODO
+ *查看可用
+ *弱爆了
+ *有时间改一下
+ */
+int get_available_worker() {
+  unsigned int i = -1, res = 0;
+  while (!free_worker_ids[(++i) % MAX_RDR_THREADS]);
+  res = i % MAX_RDR_THREADS;
+
+  free_worker_ids[res] = 0; //now it's busy
+  return res;
+}
+
+/* @describe: covert string to an unsigned integer
+ * @param:    pstr - pointer to string
+ * @return:   an unsigned integer, from 0 to 2^32 -1
+ */
+unsigned int atoui(const char *pstr) {
+  assert(pstr != NULL);
+  int sign, c;
+  unsigned int total = 0;
+
+  while (isspace((int) (unsigned char) *pstr))
+    ++pstr;
+  c = (int) (unsigned char) *pstr++;
+  sign = c;
+  if (c == '-' || c == '+')
+    c = (int) (unsigned char) *pstr++;
+
+  while (isdigit(c)) {
+    total = total * 10 + (c - '0');
+    c = (int) (unsigned char) *pstr++;
+  }
+
+  //ignore sign, because it's unsigned.
+  
+  return total;
+}
+
+//for test
+void copy_ippacket(struct iphdr *lhs, struct iphdr *rhs) {
+  lhs->ihl = rhs->ihl;
+  lhs->version = rhs->version;
+  lhs->tos = rhs->tos;
+  lhs->tot_len = rhs->tot_len;
+  lhs->id = rhs->id;
+  lhs->frag_off = rhs->frag_off;
+  lhs->ttl = rhs->ttl;
+  lhs->protocol = rhs->protocol;
+  lhs->check = rhs->check;
+  lhs->saddr = rhs->saddr;
+  lhs->daddr = rhs->daddr;
+}
+
+//for test
+void is_same_ippacket(struct iphdr *lhs, struct iphdr *rhs) {
+  if (lhs->ihl != rhs->ihl) {
+#ifdef MLOG
+    log->debug("ihl not equal");
+#endif
+  }
+  if (lhs->version != rhs->version) {
+#ifdef MLOG
+    log->debug("version not equal");
+#endif
+  }
+  if (lhs->tos != rhs->tos) {
+#ifdef MLOG
+    log->debug("tos not  equal");
+#endif
+  }
+  if (lhs->tot_len != rhs->tot_len) {
+#ifdef MLOG
+    log->debug("tot_len not equal");
+#endif
+  }
+  if (lhs->id != rhs->id) {
+#ifdef MLOG
+    log->debug("id not equal");
+#endif
+  }
+  if (lhs->frag_off != rhs->frag_off) {
+#ifdef MLOG
+    log->debug("frag_off not equal");
+#endif
+  }
+  if (lhs->ttl != rhs->ttl) {
+#ifdef MLOG
+    log->debug("ttl not equal");
+#endif
+  }
+  if (lhs->protocol != rhs->protocol) {
+#ifdef MLOG
+    log->debug("protocol not equal");
+#endif
+  }
+  if (lhs->check != rhs->check) {
+#ifdef MLOG
+    log->debug("check not equal");
+#endif
+  }
+  if (lhs->saddr != rhs->saddr) {
+#ifdef MLOG
+    log->debug("saddr not equal");
+#endif
+  }
+  if (lhs->daddr != rhs->daddr) {
+#ifdef MLOG
+    log->debug("daddr not equal");
+#endif
+  } 
+}
+
+/* @describe get localhost ip addr
+ * @param    outip[out] - the local ip
+ * @return   -1 - failed, 0 - success
+ */
+int get_local_ip(char* outip) {
+  int i = 0;
+  int sockfd;
+  struct ifconf ifconf;
+  char buf[512];
+  struct ifreq *ifreq;
+  char* ip;
+
+  ifconf.ifc_len = 512;
+  ifconf.ifc_buf = buf;
+
+  if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    return -1;
+  }
+
+  ioctl(sockfd, SIOCGIFCONF, &ifconf); //get all ifconfig
+  close(sockfd);
+
+  ifreq = (struct ifreq*) buf;
+  for (i = (ifconf.ifc_len / sizeof(struct ifreq)); i > 0; --i) {
+    ip = inet_ntoa(((struct sockaddr_in*) &(ifreq->ifr_addr))->sin_addr);
+
+    if (strcmp(ip, "127.0.0.1") == 0) {
+      ++ifreq;
+      continue;
+    }
+    strcpy(outip, ip);
+    return 0;
+  }
+
+  return -1;
+}
+
+/* @describe: connect to the local tun device
+ * @param     dev, flags
+ * @return    -1 - error
+ */
+int tun_alloc(char *dev, int flags) {
+  struct ifreq ifr;
+  int fd, tfd, err;
+  const char *clonedev = "/dev/net/tun";
+  uri_prefix[0] = '\0';
+
+  /* Arguments taken by the function:
+   *
+   * char *dev: the name of an interface (or '\0'). MUST have enough
+   *   space to hold the interface name if '\0' is passed
+   * int flags: interface flags (eg, IFF_TUN etc.)
+   */
+  
+  /* open the clone device */
+  if ((fd = open(clonedev, O_RDWR)) < 0) {
+#ifdef MLOG
+    log->error("COULD NOT OPEN %s", clonedev);
+#endif
+    return fd;
+  }
+
+  /* preparation of the struct ifr, of type "struct ifreq" */
+  memset(&ifr, 0, sizeof(ifr));
+
+  ifr.ifr_flags = flags;
+
+  /* Flags: IFF_TUN   - TUN device (no Ethernet headers)
+   *        IFF_TAP   - TAP device
+   *
+   *        IFF_NO_PI - Do not provide packet information
+   *
+   *        If flag IFF_NO_PI is not set each frame format is:
+   *             Flags [2 bytes]
+   *             Proto [2 bytes]
+   *             Raw protocol(IP, IPv6, etc) frame.
+   */
+
+  if (*dev) {
+    /* if a device name was specified, put it in the structure; otherwise,
+     * the kernel will try to allocate the "next" device of the
+     * specified type */
+    strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+  }
+
+  /* try to create the device */
+  if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
+    close(fd);
+    return err;
+  }
+
+  /* if the operation was successful, write back the name of the
+   * interface to the variable "dev", so the caller can know
+   * it. Note that the caller MUST reserve space in *dev (see calling
+   * code below) */
+  strcpy(dev, ifr.ifr_name);
+
+  if (ioctl(fd, TUNSETNOCSUM, 1) < 0) {//TODO: why?
+#ifdef MLOG
+    log->error("ioctl TUNSETNOCSUM error");
+#endif
+    safe_exit(1);
+  }
+  //
+  // get local IP
+  /*
+   * It not works well on my machine.
+   * 
+   tfd = socket(AF_INET, SOCK_DGRAM, 0);//IPPROTO_UDP); TODO: why?
+   if ((err = ioctl(tfd, SIOCGIFADDR, &ifr)) < 0) {//Get interface address
+   if (DEBUG)
+#ifdef MLOG
+   log->debug("COULD NOT OPEN %s", TUN_DEV);
+#endif
+   close(tfd);
+   return err;
+   }
+
+   sprintf(uri_prefix, "/%s/%s",
+   inet_ntoa(((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr),
+   TUN_URI_TRANSITION_ID);
+   localIp = ((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr.s_addr;
+   //  set_uri_prefix();
+   */
+
+  char lip[16] = { '\0' };
+  if (get_local_ip(lip) == -1) {
+#ifdef MLOG
+    log->error("get local ip ERROR");
+#endif
+    return -1;
+  }
+  
+  sprintf(uri_prefix, "/%s/%s", APPLICATION_ID, lip);
+  //localIp = inet_addr(lip);
+  
+  return fd;
+}
+
+/* @describe: DJB Hash Function
+ * @detail:
+ *  from http://www.cse.yorku.ca/~oz/hash.html
+ *  this algorithm (k=33) was first reported by dan bernstein many years ago
+ *  in comp.lang.c. another version of this algorithm (now favored by
+ *  bernstein) uses xor: hash(i) = hash(i - 1) * 33 ^ str[i]; the magic of
+ *  number 33 (why it works better than many other constants, prime or not) has
+ *  never been adequately explained.
+ */
+unsigned long times33_hash(uint8_t *data, int len) {
+  unsigned long hash = 5381;
+  unsigned int c, i;
+  for (i = 0; i < len; ++i) {
+    c = *data++;
+    hash = ((hash << 5) + hash) + c; // times 33
+  }
+  
+  return hash;
+}
+
+/* @describe: send_data, put data to content store
+ * @param: lccn_h - ccn handle
+ * @param: pdata - the data buffer to be sent
+ * @param: data_len - data length
+ * @param: prui - pointer to uri
+ */
+int send_data(struct ccn *lccn_h, void* pdata,
+           size_t data_len, const char *puri) {
+
+  int verbose = 0;
+  int local_log_id = g_log_id++;
+
+#ifdef MLOG
+  log->debug("[TRACE] ENTER send_data (%d) puri=%s", local_log_id, puri);
+#endif
+  
+  enum ccn_content_type content_type = CCN_CONTENT_DATA;
+
+  //TODO: adding the ccnx: prefix is hacked for now
+  char uri[MAX_URI_LEN] = { '\0' };
+
+  sprintf(uri, "ccnx:%s", puri);
+
+  //TODO: optional feature - dynamically add entry to routing table
+  //这个前缀和要发送的IP包唯一对应，当这样的interest到达时，就可以得到对应的Data
+
+  struct ccn_charbuf* name = ccn_charbuf_create();
+  int res = ccn_name_from_uri(name, uri);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("bad ccn URI: %s", uri);
+    log->debug("EXIT send_data");
+#endif
+    ccn_charbuf_destroy(&name);
+    return 1;
+  }
+
+  // 要发送的数据
+  struct ccn_charbuf* temp = ccn_charbuf_create();
+
+  struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
+  sp.type = content_type;
+
+  //Q: 这里的name相当于是本地IP的URI,算完签名有什么用? 接收后还有处理吗?
+  //A: 不是给对方接收的，数据放在本地的CS里，当匹配name时，interest就会被响应
+  //Q: 签名没什么用？但这里直接把buf里的数据放到temp里了，接下来再发出去？
+  //A: 签名就是加了数据的name，以响应对应的interest，所谓的发出去，不过是放在CS里
+  // Create the signed content object, ready to go
+  res = ccn_sign_content(lccn_h, temp, name, &sp, pdata, data_len);
+  ccn_charbuf_destroy(&name);
+
+  if (res != 0) {
+#ifdef MLOG
+    log->debug("[ERROR] in send_data Failed to encode ContentObject");
+    log->debug("EXIT send_data");
+#endif
+    ccn_charbuf_destroy(&temp);
+    return (res);
+  }
+
+  //do send
+  //put to content store
+  res = ccn_put(lccn_h, temp->buf, temp->length);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("ccn_put failed");
+#endif
+    ccn_charbuf_destroy(&temp);
+    return (res);
+  }
+
+
+  /*
+   if (verbose) {
+   struct ccn_charbuf *uriTmp = ccn_charbuf_create();
+   uriTmp->length = 0;
+   ccn_uri_append(uriTmp, name->buf, name->length, 1);
+   if (DEBUG)
+#ifdef MLOG
+   log->debug("wrote %s", ccn_charbuf_as_string(uriTmp));
+#endif
+   ccn_charbuf_destroy(&uriTmp);
+   }
+   */
+
+  if (sp.template_ccnb)
+    ccn_charbuf_destroy(&sp.template_ccnb);
+#ifdef MLOG
+  log->debug("[TRACE] EXIT send_data (%d) res=%d, write %d bytes ",
+             local_log_id, res, temp->length);
+#endif
+  ccn_charbuf_destroy(&temp);
+  return 0;
+}
+
+/* @describe: get data
+ * @param ...
+ */
+int recv_data(struct ccn *lccn_h,
+           struct ccn_charbuf *resultbuf,
+           const char *uri,
+           struct ccn_parsed_ContentObject *pcobuf,
+           int timeout) {
+
+  int res;
+  int allow_stale = 0;
+  int content_only = 0;
+  const unsigned char *ptr;
+  size_t length;
+  int resolve_version = 0;
+  int timeout_ms = 3000;
+  
+  const char *env_timeout = getenv("CCN_LINGER");
+  if (env_timeout != NULL && (res = atoi(env_timeout)) > 0) {
+#ifdef MLOG
+    log->debug("env_timeout NOT NULL, is: %s", env_timeout);
+#endif
+    timeout_ms = res * 1000;
+  }
+
+  if (timeout >= 0)
+    timeout_ms = timeout;
+
+  int local_log_id = g_log_id++;
+
+#ifdef MLOG
+  log->debug("[TRACE] ENTER recv_data (%d) '%s'", local_log_id, uri);
+#endif
+
+  struct ccn_charbuf *name = ccn_charbuf_create();
+  res = ccn_name_from_uri(name, uri);
+
+  if (res < 0) {
+#ifdef MLOG
+    log->error("bad ccn URI (1): %s", uri);
+    log->error("EXIT recv_data");
+#endif
+    ccn_charbuf_destroy(&name);
+    return 1;
+  }
+
+  struct ccn_charbuf *interest_template = NULL;
+
+  /**************what is this*****************/
+  /*
+   if (allow_stale || env_timeout != NULL) {
+   interest_template = ccn_charbuf_create();
+   ccn_charbuf_append_tt(interest_template, CCN_DTAG_Interest, CCN_DTAG);
+   ccn_charbuf_append_tt(interest_template, CCN_DTAG_Name, CCN_DTAG);
+   ccn_charbuf_append_closer(interest_template); // </Name>
+   if (allow_stale) {
+   ccn_charbuf_append_tt(interest_template, CCN_DTAG_AnswerOriginKind, CCN_DTAG);
+   ccnb_append_number(interest_template, CCN_AOK_DEFAULT | CCN_AOK_STALE);
+   ccn_charbuf_append_closer(interest_template); // </AnswerOriginKind>
+   }
+   if (env_timeout != NULL) {
+
+   // Choose the interest lifetime so there are at least 3
+   // expressions (in the unsatisfied case).
+
+   unsigned char buf[3] = { 0 };
+   unsigned lifetime;
+   int i;
+   if (timeout_ms > 60000)
+   lifetime = 30 << 12;
+   else {
+   lifetime = timeout_ms * 2 / 5 * 4096 / 1000;
+   }
+   for (i = sizeof(buf) - 1; i >= 0; i--, lifetime >>= 8)
+   buf[i] = lifetime & 0xff;
+   ccnb_append_tagged_blob(interest_template, CCN_DTAG_InterestLifetime, buf,
+   sizeof(buf));
+   }
+   ccn_charbuf_append_closer(interest_template); // </Interest>
+   }
+   */
+  /***********************************************/
+
+  /*
+   if (resolve_version != 0) {
+   res = ccn_resolve_version(lccn_h, name, resolve_version, 500);
+   if (res >= 0) {
+   ccn_uri_append(resultbuf, name->buf, name->length, 1);
+   if (DEBUG)
+#ifdef MLOG
+   log->debug("== %s", ccn_charbuf_as_string(resultbuf));
+#endif
+   resultbuf->length = 0;
+   }
+   }
+   */
+
+  res = ccn_get(lccn_h, name, interest_template, timeout_ms,
+                resultbuf, pcobuf, NULL, 0);
+
+  //if (res >= 0) {
+  //    ptr = resultbuf->buf;
+  //    length = resultbuf->length;
+  //    if (content_only)
+  //        ccn_content_get_value(ptr, length, &pcobuf, &ptr, &length);
+  //    if (length > 0)
+  //        res = fwrite(ptr, length, 1, stdout) - 1;
+  // }
+
+  ccn_charbuf_destroy(&name);
+  
+  if (interest_template)
+    ccn_charbuf_destroy(&interest_template);
+#ifdef MLOG
+  log->debug("[TRACE] EXIT recv_data (%d) res=%d bytesRead=%d",
+             local_log_id, res, resultbuf->length);
+#endif
+  return 0;
+}
+
+
+void* waiting_loop(struct ccn *h) {
+  int res = ccn_run(h, -1); //main event loop
+  if (res < 0) {
+#ifdef MLOG
+    log->error("interest listening handler setup failed");
+#endif
+    ccn_destroy(&h);
+    safe_exit(1);
+  }
+}
+
+
+/* @describe: get return uri
+ *  returns a pointer to the index of the start of the return interest
+ * @param: uri - original uri
+ * @param: ret_uri - pointer to return uri
+ * @param: length - encode header length(when trans TCP)
+ * @return: NULL - ERROR
+ */
+void* get_return_uri(const char *uri, char* ret_uri, int* length) {
+  int numCompsFound = 0;
+  int index = 0;
+  int uri_len = strlen(uri);
+
+  for (; index < uri_len && numCompsFound < RET_INTEREST_COMP_INDEX; ++index) {
+    if (uri[index] == '/')
+      ++numCompsFound;
+  }
+  if (numCompsFound == RET_INTEREST_COMP_INDEX) {
+    int ret_uri_start = index - 1;
+    int cnt = 0;
+    for (; index < uri_len && cnt < 5; ++index) {
+      if (uri[index] == '/')
+        ++cnt;
+    }
+    if (5 == cnt) {
+      //copy return-uri to ret_uri, not including the last '/'
+      memmove(ret_uri, &uri[ret_uri_start], index - ret_uri_start - 1);
+      int ret_len_start = index;
+      for (; index < uri_len; ++index) {
+        if (uri[index] == '/')
+          break;
+      }
+      if (index < uri_len) {
+        char tmp[10] = { '\0' };
+        *length = atoi(&uri[ret_len_start]);
+#ifdef MLOG
+        log->debug("length from uri =%d", *length);
+#endif
+        return (void*)&uri[index + 1]; //remaining data
+      } else {
+        return NULL;
+      }
+
+    } else {
+      return NULL;
+    }
+  } else {
+    return NULL;
+  }
+}
+
+/* overloading version for IP
+ * very simple
+ */
+char *get_return_uri(const char *uri) {
+  int numCompsFound = 0;
+  int i;
+  int uriLen = strlen(uri);
+  for (i = 0; i < uriLen && numCompsFound < RET_INTEREST_COMP_INDEX; i++) {
+    if (uri[i] == '/')
+      numCompsFound++;
+  }
+  return (numCompsFound == RET_INTEREST_COMP_INDEX) ? &uri[i - 1] : NULL;
+}
+
+/*TODO: any bug?
+ *
+ */
+void get_incoming_uri(char *uri, struct ccn_upcall_info *info) {
+  const unsigned char *ptr = info->interest_ccnb;
+  int cur_max_cpy = MAX_URI_LEN;
+  int cur_len = 0;
+
+  do {
+    while (*ptr++ != 0xFA);
+    strcat(uri, "/");
+    --cur_max_cpy;
+    if (cur_max_cpy > 0) {
+      strncat(uri, ++ptr, cur_max_cpy);
+      cur_len = strlen(ptr);
+      ptr += cur_len;
+      cur_max_cpy -= cur_len;
+    }
+  } while (((*ptr++ != '\0') || (*ptr != '\0')) && (cur_max_cpy > 0));
+
+  strcat(uri, "/");
+}
+
+/* @describe: handle interest when using TCP
+ *
+ */
+void handle_incoming_interest_tcp(char* incoming_uri, unsigned char* alldata, int& alldata_len) {
+
+#ifdef MLOG
+  log->info(">>>>> CCN data received...");
+#endif
+  
+  char ret_interest_uri[MAX_URI_LEN] = { '\0' };
+  //unsigned char alldata[MAX_PACKET_SIZE] = { '\0' };
+  int encode_unit;
+  struct ccn_parsed_ContentObject pcobuf = { 0 };
+  
+  unsigned char* pdata =
+      (unsigned char*) get_return_uri(incoming_uri,
+                                      ret_interest_uri,
+                                      &encode_unit);
+  
+  if (NULL == pdata || '\0' == ret_interest_uri[0]) {
+#ifdef MLOG
+    log->warn("Unable to find return interest name, dropping");
+#endif
+  } else {
+#ifdef MLOG
+    log->debug("get: encode_unit = %d", encode_unit);
+#endif
+    unsigned int* c2int = (unsigned int*) alldata;
+    int cnt = 0;
+    char *pos = NULL;
+
+    while (1) {
+      pos = strchr((char*)pdata, (int)('/'));
+      if (NULL == pos)
+        break;
+      *pos = '\0';
+      unsigned int val = atoui(pdata);
+      c2int[cnt] = val;
+
+      ++cnt;
+      pdata = pos + 1;
+    }
+
+    
+    if (cnt != encode_unit) {
+#ifdef MLOG
+      log->error("cnt=%d != encode_unit=%d", cnt, encode_unit);
+#endif
+    }
+    
+    //memmove(alldata, pdata, encode_unit);
+    
+    //decoding
+    alldata_len = encode_unit * sizeof(int);
+    //int alldata_len = encode_unit;
+    
+#ifdef MLOG
+    log->debug("[TRACE] handled header, alldata_len=%d", alldata_len);
+#endif
+    
+    struct ccn_charbuf *resultbuf = ccn_charbuf_create();
+    
+    // get the data that the remote app is sending and pass it to
+    // the local app via the tunnel
+    int res;
+    //int tmpIndx = get_available_worker();
+    
+    //从interest来源处get
+    //所谓的get就是发interest要数据
+    char uri[MAX_URI_LEN] = { '\0' };
+    sprintf(uri, "ccnx:%s", ret_interest_uri);
+    res = recv_data(ccnh_workers, resultbuf, uri, &pcobuf, -1);
+    //free_worker_ids[tmpIndx] = 1; //set it available
+    
+    if (res >= 0) {
+      int bytesWritten = 0;
+      
+#ifdef MLOG
+      log->info("## receiving %d...", g_packet_count++);
+      log->info("data received from remote app, passing to local app");
+#endif
+      
+      const unsigned char *ptr = resultbuf->buf;
+      unsigned int length = resultbuf->length;
+      
+      ccn_content_get_value(resultbuf->buf, resultbuf->length, &pcobuf,
+                            &ptr, &length);
+      
+      if (NULL == ptr) {
+#ifdef MLOG
+        log->warn("!!ptr == NULL!!");
+#endif
+      } else {
+#ifdef MLOG
+        log->debug("[ccn_content_get_value]: get data length=%d", length);
+#endif
+        memmove(alldata + alldata_len, ptr, length);
+        alldata_len += length;
+      }
+
+      /* //for test
+         struct iphdr* ip_header = (struct iphdr*) alldata;
+         int total_len = ntohs(ip_header->tot_len);
+#ifdef MLOG
+         log->debug("ip version=%d, ip header len = %d",
+         ip_header->version, ip_header->ihl);
+         log->debug("ip len = %d", total_len);
+#endif
+         struct in_addr ipaddr;
+         ipaddr.s_addr = ip_header->daddr;
+#ifdef MLOG
+         log->debug("recv dest=%s", inet_ntoa(ipaddr));
+#endif
+         ipaddr.s_addr = ip_header->saddr;
+#ifdef MLOG
+         log->debug("recv src=%s", inet_ntoa(ipaddr));
+#endif
+         //cpy_ippacket(ip_header, (struct iphdr*)ptr);
+         //is_same_ippacket(ip_header, (struct iphdr*)ptr);
+         //is_same_ippacket((struct iphdr*)alldata, (struct iphdr*)ptr);
+         
+        if (length != total_len) {
+#ifdef MLOG
+        log->debug("\n[WARNING] !! length=%d != ip_header len=%d", length, total_len);
+#endif
+        }
+        
+        if (memcmp(alldata, ptr, total_len) != 0 ) {
+#ifdef MLOG
+        log->debug("\n[WARNING] !! alldata not equal ptr, total_len = %d", total_len);
+#endif
+        }
+        
+        
+        unsigned char encode_header[512] = {'\0'};
+        unsigned char headbuf[128] = {'\0'};
+        
+        //get ip and tcp header
+        
+        memmove(headbuf, alldata, total_len);
+        c2int = (unsigned int*)headbuf;
+        int encode_header_len = 0;
+        int i = 0;
+        encode_unit = total_len / sizeof(int);
+        for (i = 0; i < encode_unit; ++i) {
+        int len = sprintf(encode_header + encode_header_len, "%u/", c2int[i]);
+        encode_header_len += len;
+        }
+#ifdef MLOG
+        log->debug("[CHECK]%s[/CHECK]", encode_header);
+#endif
+        */
+      
+    } else {
+#ifdef MLOG
+      log->warn("no data received from remote app (rc=%d)", res);
+#endif
+    }
+
+    ccn_charbuf_destroy(&resultbuf);
+  }
+  
+}
+
+/* @describe: handle interest when using IP
+ *
+ */
+void handle_incoming_interest_ip(char *incoming_uri, unsigned char* alldata, int& alldata_len) {
+  struct ccn_parsed_ContentObject pcobuf = { 0 };
+  char *retInterestUri = NULL;
+  if ((retInterestUri = get_return_uri(incoming_uri)) == NULL) {
+#ifdef MLOG
+    log->warn("Unable to find return interest name, dropping");
+#endif
+  } else {
+    struct ccn_charbuf *resultbuf = ccn_charbuf_create();
+    int res;
+    //int tmpIndx = get_available_worker();
+    res = recv_data(ccnh_workers, resultbuf, retInterestUri, &pcobuf, -1);
+    //free_worker_ids[tmpIndx] = 1; //set it available
+    
+    if (res >= 0) {
+#ifdef MLOG
+      log->info("## receiving %d...", g_packet_count++);
+      log->info("data received from remote app, passing to local app");
+#endif
+      //TODO, this may lead to destroy bufffer incorrectly
+      const unsigned char *ptr = resultbuf->buf;
+      unsigned int length = resultbuf->length;
+      ccn_content_get_value(resultbuf->buf, resultbuf->length, &pcobuf,
+                            &ptr, &length);
+
+      //copy data
+      memmove(alldata, ptr, length);
+      alldata_len = length;
+      
+    } else {
+#ifdef MLOG
+      log->warn("no data received from remote app (res=%d)", res);
+#endif
+    }
+    ccn_charbuf_destroy(&resultbuf);
+  }
+}
+
+/* @describe:
+ *  Handles a remote interest request so send return interest to get
+ *  data and send the data to the tunnel.
+ *  Start out by pulling the CCN name out of the packet.
+ *  Then make sure the prefix matches that of this tunnel
+ *  and assume that it is a remote interest request (no one should
+ *  be writing any other CCN content to the tunnel)
+ */
+enum ccn_upcall_res incoming_interest(struct ccn_closure *selfp,
+                                      enum ccn_upcall_kind kind,
+                                      struct ccn_upcall_info *info) {
+  // received uri
+  char incoming_uri[MAX_URI_LEN] = { '\0' };
+  //struct ccn_charbuf *cob = selfp->data;
+  
+  //TODO
+  get_incoming_uri(incoming_uri, info);
+#ifdef MLOG
+  log->debug("incoming_uri = %s", incoming_uri);
+#endif
+
+  // IP Packet DATA
+  unsigned char alldata[MAX_PACKET_SIZE] = { '\0' };
+  int alldata_len = 0;
+
+  //检查incoming_uri前缀是否匹配本地
+  //in fact, it's not necessary, only for checking.
+  if ((kind == CCN_UPCALL_INTEREST) &&
+      strncmp(uri_prefix, incoming_uri, strlen(uri_prefix)) == 0) {
+    
+#ifdef MLOG
+    log->info("successfully pulled CCN name");
+#endif
+
+    //
+    // get IP Packet from CCN, according to specified protocol
+    //
+    if (g_setting.protocol == PT_TCP) {
+#ifdef MLOG
+      log->info("protocol == TCP");
+#endif
+      handle_incoming_interest_tcp(incoming_uri, alldata, alldata_len);
+      
+    } else if (g_setting.protocol == PT_IP){
+#ifdef MLOG
+      log->info("protocol == IP");
+#endif
+      handle_incoming_interest_ip(incoming_uri, alldata, alldata_len);
+      
+    } else {
+#ifdef MLOG
+      log->error("unrecognized protocol, must be IP or TCP");
+#endif
+      //TODO: exit or not ?
+    }
+
+#ifdef MLOG
+    log->debug("before write to TUN, alldata_len=%d", alldata_len);
+#endif
+
+    //把从CCN中收到的数据写到TUN
+    pthread_mutex_lock(&g_mutex);
+    int bytesWritten = write(tun_fd, alldata, alldata_len);
+    pthread_mutex_unlock(&g_mutex);
+    
+    if (-1 == bytesWritten) {
+#ifdef MLOG
+      log->error("failed to write to TUN, return -1");
+#endif
+    }
+    
+    if (bytesWritten != alldata_len) {
+#ifdef MLOG
+      log->error("error in writing to tun (%d of %d bytes)",
+                 bytesWritten, alldata_len);
+#endif
+    }
+    
+#ifdef MLOG
+    log->info("sent %d bytes to local app via tunnel", bytesWritten);
+#endif
+    
+  } else { //收到interest，但不和本地IP匹配
+#ifdef MLOG
+    log->warn("content name does not match tunnel prefix, dropping !!");
+    log->warn("uri='%s'", incoming_uri);
+#endif
+  }
+  
+  //TODO: return
+}
+
+
+//TODO
+enum ccn_upcall_res ts_nop(struct ccn_closure *selfp,
+                           enum ccn_upcall_kind kind,
+                           struct ccn_upcall_info *info) {
+  // do nothing
+}
+
+/* @describe: to construct uri
+ * @param:    uri, the result
+ * TCP version
+ */
+int construct_uri(const struct iphdr *ip_packet,
+                  const int ip_tot_len,
+                  const char *dest_ip_addr,
+                  char *uri,
+                  unsigned char** pdata,
+                  int *data_len) {
+
+  int tcphdr_start = ip_packet->ihl * 4;      //also ip data start
+  unsigned char* pbuf = (unsigned char*) ip_packet;
+  struct tcphdr* tcp_packet = (struct tcphdr*) &pbuf[tcphdr_start];
+  int tcp_data_start = tcphdr_start + tcp_packet->doff * 4;
+  
+  // record to return
+  *data_len = ip_tot_len - tcp_data_start; //also, real payload
+  *pdata = &pbuf[tcp_data_start];
+
+#ifdef MLOG
+  log->debug("tcp_data_start = %d, ip_tot_len = %d, data_len = %d",
+             tcp_data_start, ip_tot_len, data_len);
+#endif
+  //IP header size: 20~60, TCP header size:20~60, max: 120
+  unsigned char encode_header[512] = { '\0' };
+  unsigned int *c2int = (unsigned int*) pbuf;
+  int encode_header_len = 0;
+  int encode_unit = tcp_data_start / sizeof(int);
+
+  // encoding header
+  int i = 0;
+  for (i = 0; i < encode_unit; ++i) {
+    encode_header_len += sprintf(encode_header + encode_header_len,
+                                 "%u/", c2int[i]);
+  }
+#ifdef MLOG
+  log->debug("encode unit = %d, encode header len = %d",
+             encode_unit, encode_header_len);
+#endif
+  // digest
+  char digest[36] = {'\0'};
+  CMD5 md5;
+  md5.GenerateMD5(*pdata, *data_len);
+  std::string md5_str = md5.ToString();
+
+  //Q: why split into 4 segments ?
+  //A: FUCK, it always collapses. I cannot figure out why
+  std::string md5_seg1 = md5_str.substr(0, 8);
+  std::string md5_seg2 = md5_str.substr(8, 8);
+  std::string md5_seg3 = md5_str.substr(16, 8);
+  std::string md5_seg4 = md5_str.substr(24, 8);
+
+  sprintf(digest, "%s/%s/%s/%s",
+          md5_seg1.c_str(),
+          md5_seg2.c_str(),
+          md5_seg3.c_str(),
+          md5_seg4.c_str());
+  
+  sprintf(uri, "ccnx:/%s/%s/%X/%s/%s/%d/%s",
+          APPLICATION_ID, dest_ip_addr, time(NULL),
+          APPLICATION_ID, digest, encode_unit, encode_header);
+}
+
+/* @describe: to construct uri
+ * @param:    uri, the result
+ * IP version
+ */
+int construct_uri(struct iphdr *ip_packet, const int ip_tot_len,
+                  const char* dest_ip_addr, char *uri) {
+  
+  sprintf(uri, "ccnx:/%s/%s/%X/%s/%08X",
+          APPLICATION_ID, dest_ip_addr, time(NULL),
+          APPLICATION_ID, times33_hash((uint8_t*)ip_packet, ip_tot_len));
+}
+
+/* @describe: put data into CS, and express interest
+ * @param: lccn_h     ccn handle
+ * @param:  ip_packet ip packet from TUN   
+ */
+int request_interest(struct ccn *lccn_h, struct iphdr *ip_packet) {
+
+  int local_log_id = g_log_id++;
+#ifdef MLOG
+  log->info("[TRACE] ENTER request_interest (%d)", local_log_id);
+#endif
+
+  struct in_addr ipaddr;
+  ipaddr.s_addr = ip_packet->daddr; //get dest ip addr
+  const char* dest_ip_addr = inet_ntoa(ipaddr);
+#ifdef MLOG
+  log->info("[TRACE] dest ip addr=%s", dest_ip_addr);
+#endif
+
+  int ip_tot_len = ntohs(ip_packet->tot_len); //network to host
+
+  // TODO: size
+  char uri[MAX_PACKET_SIZE] = { '\0' };
+  char ret_uri[1024] = { '\0' };
+  int res;
+  
+  if (PT_TCP == g_setting.protocol) {
+    unsigned char* pdata = NULL;
+    int data_len = 0;
+    construct_uri(ip_packet, ip_tot_len, dest_ip_addr,
+                  uri, &pdata, &data_len);
+
+    int tmp;
+    if (NULL == get_return_uri(uri, ret_uri, &tmp) ||
+        NULL == ret_uri) {
+#ifdef MLOG
+      log->error("get_return_uri failed");
+#endif
+      return -1;
+    }
+
+    // ok, let's print the real app data
+    if (data_len <= 0) {
+      ++g_seq;
+      fprintf(DF, "%d: len = %d, [NONE]\n", g_seq, data_len);
+    } else {
+      ++g_seq;
+      fprintf(DF, "%d: len = %d, [DATA]%s\n", g_seq, data_len, pdata);
+    }
+    
+    fflush(DF);
+    
+    // only put data(payload)
+    res = send_data(lccn_h, pdata, data_len, ret_uri);
+    if (res) {
+#ifdef MLOG
+      log->error("IP packet send error");
+#endif
+    return res;
+    }
+    
+  } else if (PT_IP == g_setting.protocol) {
+    construct_uri(ip_packet, ip_tot_len, dest_ip_addr, uri);
+
+    char* ret_uri = get_return_uri(uri);
+    if (NULL == ret_uri) {
+#ifdef MLOG
+      log->error("get_return_uri failed");
+#endif
+      return -1;
+    }
+    
+    // total ip packet
+    res = send_data(lccn_h, ip_packet,
+                    ntohs(ip_packet->tot_len), ret_uri);
+    if (res) {
+#ifdef MLOG
+      log->error("IP packet send error");
+#endif
+      return res;
+    }
+    
+  } else {
+#ifdef MLOG
+    log->error("unrecognized protocol");
+#endif
+  }
+
+#ifdef MLOG
+  log->info("To send interest, uri=%s, ret_uri=%s", uri, ret_uri);
+#endif
+  
+  struct ccn_charbuf* name = ccn_charbuf_create();
+  res = ccn_name_from_uri(name, uri);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("unable to get name for request interest, rc=%d", res);
+#endif
+    ccn_charbuf_destroy(&name);
+    return res;
+  }
+
+  // first put, then express interest
+  struct ccn_closure *cl = calloc(1, sizeof(*cl));
+  cl->p = &ts_nop;  // ccn_handler
+  cl->data = NULL;
+  cl->intdata = 3;  // only send interest once
+  cl->refcount = 0; // calloc already done
+  //TODO: try to set cl==NULL // not a good idea
+
+  // sending Interest:
+  // uri=ccnx:/TRANSITION/dest_ip_addr/timestamp/TRANSITION/md5/header/
+#ifdef MLOG
+  log->info("put data to cs, done, now, express interest...");
+#endif
+  //TODO: cl.p do nothing?
+  res = ccn_express_interest(lccn_h, name, cl, NULL); 
+
+#ifdef MLOG
+  log->info("[TRACE] EXIT request_interest (%d) res=%d", local_log_id, res);
+#endif
+
+  ccn_charbuf_destroy(&name);
+
+  //ABOUT: struct ccn_closure {}
+  /**
+   * Handle for upcalls that allow clients receive notifications of
+   * incoming interests and content.
+   *
+   * The client is responsible for managing this piece of memory and the
+   * data therein. The refcount should be initially zero, and is used by the
+   * library to keep to track of multiple registrations of the same closure.
+   * When the count drops back to 0, the closure will be called with
+   * kind = CCN_UPCALL_FINAL so that it has an opportunity to clean up.
+   */
+  //free(cl); //so, can not be freed here.
+  
+  return res;
+}
+
+
+/* 把从TUN上收到数据从CCN发出去
+ * 要这么做，先要调用request_interest,
+ * 即先发interest过去，请求对方发interest过来取数据
+ */
+/*
+void handle_send(int id, struct iphdr *ip_pkt) {
+
+  RdrArgs* rdrargs = (RdrArgs*) args;
+#ifdef MLOG
+  log->debug("[TRACE] sending with thread %d", rdrargs->thread_id);
+  log->info("IP packet received from local app...");
+  log->info("## sending %d...", g_packet_count++);
+#endif
+  
+  //TUN从APP收到数据，（要发给目的IP地址的IP数据包）
+  //接下来先向这个目的IP，发interest，让其发interest过来，这样就可以把APP的数据作为响应的DATA发回
+  //所以，接下来的本质就是请求interest
+  int res = request_interest(ccnh_workers[rdrargs->thread_id], rdrargs->ip_pkt);
+  if (res != 0) {
+    log->warn("sending interest for IP packet failed (pc=%d) res=%d",
+              (g_packet_count - 1), res);
+  }
+
+  free_worker_ids[rdrargs->thread_id] = 1; //set this thread available
+
+  free(rdrargs->ip_pkt); //free buf
+  free(rdrargs);
+  
+#ifdef MLOG
+  log->info("handle_send() finished with thread %d", rdrargs->thread_id);
+#endif
+}
+*/
+
+
+int main(int argc, char * argv[]) {
+  int i, res;
+  char tun_name[IFNAMSIZ]; // 16
+  char *buffer = NULL;
+  int maxfd, nread, ret;
+  fd_set rset;
+
+  /*
+   * TODO: usage
+  char usage[] = "usage: ./transition tun0";
+  if (argc != 2) { //ignore other args
+    printf("%s", usage);
+    exit(1);
+  }
+  */
+  
+  //TODO: use -f to specify configure file
+  std::string config_file("conf/trans.conf"); 
+  Config conf(config_file);
+
+  //init
+  int protocol = PT_TCP;
+#ifdef MLOG
+  std::string log_conf("conf/log.conf");
+  std::string log_category("transition");
+  log_conf = conf.Read("LOG_CONF", log_conf);
+  log_category = conf.Read("LOG_CATEGORY", log_category);
+#endif
+
+  protocol = conf.Read("PROTOCOL", protocol);
+  
+  //TODO: do some global setting init
+#ifdef MLOG
+  log4cpp::PropertyConfigurator::configure(log_conf);
+  log = &log4cpp::Category::getInstance(log_category);
+#endif
+  g_setting.protocol = protocol;
+  g_log_id = 0;
+  g_packet_count = 0;
+
+  //TODO: JUST FOR TESTING, I WANNA KNOW THE RAW DATA.
+  DF = fopen ("./log/data.file", "w");
+  g_seq = 0;
+
+  
+  // start
+#ifdef MLOG
+  log->info("========= NEW SESSION =========");
+#endif
+
+  strncpy(tun_name, TUN_DEV, IFNAMSIZ);
+
+  /* connects to the tun device. IFF_TUN means the packet will include
+   * IP header, TCP/UDP header, and  the payload.
+   */
+  tun_fd = tun_alloc(tun_name, IFF_TUN | IFF_NO_PI);
+  if (tun_fd < 0) {
+#ifdef MLOG
+    log->error("Allocating interface");
+#endif
+    safe_exit(1);
+  }
+#ifdef MLOG
+  log->info("TUN name: %s, tun_fd=%d", tun_name, tun_fd);
+#endif
+  maxfd = tun_fd + 1;
+
+  /*
+  // init free_worker_ids array
+  for (i = 0; i < MAX_RDR_THREADS; ++i) {
+    free_worker_ids[i] = 1; //1 means available
+    ccnh_workers[i] = ccn_create();
+    res = ccn_connect(ccnh_workers[i], NULL);
+    if (res < 0) {
+#ifdef MLOG
+      log->error("ccn_connect error");
+#endif
+      safe_exit(1);
+    }
+  }
+  */
+  ccnh_workers = ccn_create();
+  res = ccn_connect(ccnh_workers, NULL);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("ccn_connect error");
+#endif
+    safe_exit(1);
+  }
+  
+  // connect to local ccnd
+  // the client handle, using to connect to local ccnd
+  // response for listening
+  struct ccn* listening_ccn_h = ccn_create();
+  if (NULL == listening_ccn_h) {
+#ifdef MLOG
+    log->error("ccn_create error");
+#endif
+    safe_exit(1);
+  }
+  
+  res = ccn_connect(listening_ccn_h, NULL);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("ccn_connect error, res = %d", res);
+#endif
+    ccn_destroy(&listening_ccn_h);
+    safe_exit(1);
+  }
+
+  // setup uri for interest handler
+  struct ccn_charbuf *name = ccn_charbuf_create();
+
+  //Convert a ccnx-scheme URI to a ccnb-encoded Name.
+  res = ccn_name_from_uri(name, uri_prefix);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("uri to ccn name failed, uri=%s", uri_prefix);
+#endif
+    ccn_charbuf_destroy(&name);
+    ccn_destroy(&listening_ccn_h);
+    safe_exit(1);
+  }
+
+  struct ccn_closure in_interest = { 0 }; // don't forget to init
+  in_interest.p = &incoming_interest;     //set callback function
+  
+  // Register to receive interests on a prefix
+  res = ccn_set_interest_filter(listening_ccn_h, name, &in_interest);
+  if (res < 0) {
+#ifdef MLOG
+    log->error("ccn_set_interest_filter");
+#endif
+    ccn_charbuf_destroy(&name);
+    ccn_destroy(&listening_ccn_h);
+    safe_exit(1);
+  }
+  ccn_charbuf_destroy(&name);
+
+#ifdef MLOG
+  log->info("registered filter: [uri_prefix=%s]", uri_prefix);
+#endif
+  
+  // --create main thread--
+  pthread_t pts;
+
+  //receiver/listening pthread
+  res = pthread_create(&pts, NULL, waiting_loop, listening_ccn_h); 
+
+  if (res < 0) {
+#ifdef MLOG
+    log->error("[main] creating thread for interest handler, failed");
+#endif
+    ccn_destroy(&listening_ccn_h);
+    ccn_destroy(&listening_ccn_h);
+    safe_exit(1);
+  }
+  
+#ifdef MLOG
+  log->info("main thread created, now waiting for data into TUN...");
+#endif
+
+  // main loop
+  while (1) {
+
+    FD_ZERO(&rset);
+    FD_SET(tun_fd, &rset);
+
+    //TODO: timeout
+    ret = select(maxfd, &rset, NULL, NULL, NULL);
+    if (ret < 1) {
+      if (-1 == ret)
+#ifdef MLOG
+        log->error("select() error!");
+#endif
+      if (0 == ret) { //may not happen
+#ifdef MLOG
+        log->warn("select() timeout!");
+#endif
+      }
+    } else { // ret > 0
+
+      // if data received from tun, it could be a local app or interest request
+      /* the buffer always starts with an IP header */
+      struct iphdr *ip_packet = (struct iphdr *)malloc(MAX_PACKET_SIZE);
+      memset(ip_packet, 0, MAX_PACKET_SIZE);
+
+      if (FD_ISSET(tun_fd, &rset)) {  // TUN DEVICE is readable
+        nread = read(tun_fd, ip_packet, MAX_PACKET_SIZE);
+        if (nread > 0) {
+
+#ifdef MLOG
+          log->info("Received data on tunnel device");
+#endif
+          // TODO: need to count
+          //
+          
+          // Check to see if this is an IP packet in which case it is from the
+          // local app and needs to be sent remotely
+          // TODO: need to create a pool of threads during startup and allocat
+          /*
+           * not need to use multi-thread
+           *
+          RdrArgs *loc_args = (RdrArgs*)malloc(sizeof(RdrArgs));
+          loc_args->thread_id = get_available_worker();
+          loc_args->ip_pkt = ip_packet;
+
+          pthread_attr_t pattr;
+          pthread_attr_init(&pattr);
+          pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
+          pthread_t pth;
+
+          // create a worker to handle the ip packet
+          pthread_create(&pth, &pattr, handle_send, loc_args);
+          */
+          //handle_send(get_available_worker(), ip_packet);
+
+          //int worker_id = get_available_worker();
+          res = request_interest(ccnh_workers, ip_packet);
+          if (res != 0) {
+#ifdef MLOG
+            log->warn("sending interest for IP packet failed! res=%d", res);
+#endif
+          }
+          //free_worker_ids[worker_id] = 1; //set this thread available
+          
+        } else {
+#ifdef MLOG
+          log->error("error in reading from tun");
+#endif
+        }
+      } //end if(FD_ISSET)
+    }
+  } //end while
+  
+  ccn_destroy(&listening_ccn_h);
+#ifdef MLOG
+  log4cpp::Category::shutdown();
+#endif
+  fclose(DF);
+  
+  return 0;
+}
