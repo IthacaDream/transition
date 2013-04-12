@@ -1,25 +1,19 @@
-/*
- * A C++ Config Class from Internet
- * It works well.
- */
 #ifndef CONFIG_H_
 #define CONFIG_H_
 
-
-#include <string>  
-#include <map>  
 #include <iostream>  
 #include <fstream>  
 #include <sstream>  
-
+#include <string>  
+#include <map>  
       
 /* 
  * \brief Generic configuration Class 
  * 
  */  
 class Config {  
-  // Data  
- protected:  
+    // Data  
+protected:  
   std::string m_Delimiter;  //!< separator between key and value  
   std::string m_Comment;    //!< separator between value and comments  
   std::map<std::string,std::string> m_Contents;  //!< extracted keys and values  

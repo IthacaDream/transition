@@ -2,6 +2,7 @@
 ## by will song
 ## upload the project to server
 # -h for help
+
 if [ "$1" = "-h" ]; then
 cat <<HELP
     usage: $0 [local_work_dir] [remote_work_dir] [server_user]
@@ -27,7 +28,7 @@ echo "user: ${USER}"
 for svr in ${SERVERS[@]}
 do
     echo scp -r $WORK_DIR ${USER}@${srv}:$REMOTE_DIR
-    #scp -r $WORK_DIR ${USER}@${svr}:$REMOTE_DIR
+    scp -r $WORK_DIR ${USER}@${svr}:$REMOTE_DIR
     echo "cp to server $s, DONE"
 done
 echo "all done"

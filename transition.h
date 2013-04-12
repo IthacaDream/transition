@@ -1,6 +1,13 @@
 #ifndef __TRANSITION_H__
 #define __TRANSITION_H__
 
+
+#ifdef __GNUC__ 
+  #define UNUSED_PARAM __attribute__ ((unused))
+#else
+  #define UNUSED_PARAM
+#endif
+
 const char* TUN_DEV = "tun0";              // default tun device
 const char* APPLICATION_ID = "transition"; // the application identify, in line with ccnd.conf
 const int URI_PREFIX_MAX_LEN = 32;         // uri prefix is always "/APPLICATION_ID/local_ip_addr/"
@@ -21,9 +28,10 @@ typedef enum {
 } ProtocalType;
 
 struct settings {
-  ProtocalType protocol;
-  
+    ProtocalType protocol;
+    //others
 };
+
 
 //TODO
 typedef struct {
@@ -32,5 +40,28 @@ typedef struct {
 }ccn_worker_queue;
 
 
+#define ts_unlikely(x) __builtin_expect((x),0)
+#define ts_likely(x) __builtin_expect((x),1)
+#define ts_prefetch(x, ...) __builtin_prefetch(x, __VA_ARGS__)
+
+
+/*
+ * Macros to calculate sub-net data using ip address and sub-net prefix
+ */
+
+#define TS_NET_IP_OCTECT(addr,pos) (addr >> (8 * pos) & 255)
+#define TS_NET_NETMASK(addr,net) htonl((0xffffffff << (32 - net)))
+#define TS_NET_BROADCAST(addr,net) (addr | ~TS_NET_NETMASK(addr,net))
+#define TS_NET_NETWORK(addr,net) (addr & TS_NET_NETMASK(addr,net))
+#define TS_NET_WILDCARD(addr,net) (TS_NET_BROADCAST(addr,net) ^ TS_NET_NETWORK(addr,net))
+#define TS_NET_HOSTMIN(addr,net) net == 31 ? TS_NET_NETWORK(addr,net) : (TS_NET_NETWORK(addr,net) + 0x01000000)
+#define TS_NET_HOSTMAX(addr,net) net == 31 ? TS_NET_BROADCAST(addr,net) : (TS_NET_BROADCAST(addr,net) - 0x01000000);
+
+
+#if __GNUC__ >= 4
+  #define TS_EXPORT __attribute__ ((visibility ("default")))
+#else
+  #define TS_EXPORT
+#endif
 
 #endif

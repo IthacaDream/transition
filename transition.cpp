@@ -217,8 +217,9 @@ int get_local_ip(char* outip) {
 
   ifconf.ifc_len = 512;
   ifconf.ifc_buf = buf;
+  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
-  if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+  if (ts_unlikely(sockfd < 0)) {
     return -1;
   }
 
@@ -760,7 +761,7 @@ void handle_incoming_interest_tcp(char* incoming_uri, unsigned char* alldata, in
 #endif
       
       const unsigned char *ptr = resultbuf->buf;
-      unsigned int length = resultbuf->length;
+      size_t length = resultbuf->length;
       
       ccn_content_get_value(resultbuf->buf, resultbuf->length, &pcobuf,
                             &ptr, &length);
@@ -865,7 +866,7 @@ void handle_incoming_interest_ip(char *incoming_uri, unsigned char* alldata, int
 #endif
       //TODO, this may lead to destroy bufffer incorrectly
       const unsigned char *ptr = resultbuf->buf;
-      unsigned int length = resultbuf->length;
+      size_t length = resultbuf->length;
       ccn_content_get_value(resultbuf->buf, resultbuf->length, &pcobuf,
                             &ptr, &length);
 
@@ -947,13 +948,13 @@ enum ccn_upcall_res incoming_interest(struct ccn_closure *selfp,
     int bytesWritten = write(tun_fd, alldata, alldata_len);
     pthread_mutex_unlock(&g_mutex);
     
-    if (-1 == bytesWritten) {
+    if (ts_unlikely(-1 == bytesWritten)) {
 #ifdef MLOG
       log->error("failed to write to TUN, return -1");
 #endif
     }
     
-    if (bytesWritten != alldata_len) {
+    if (ts_unlikely(bytesWritten != alldata_len)) {
 #ifdef MLOG
       log->error("error in writing to tun (%d of %d bytes)",
                  bytesWritten, alldata_len);
@@ -1289,7 +1290,7 @@ int main(int argc, char * argv[]) {
    * IP header, TCP/UDP header, and  the payload.
    */
   tun_fd = tun_alloc(tun_name, IFF_TUN | IFF_NO_PI);
-  if (tun_fd < 0) {
+  if (ts_unlikely(tun_fd < 0)) {
 #ifdef MLOG
     log->error("Allocating interface");
 #endif
@@ -1316,7 +1317,7 @@ int main(int argc, char * argv[]) {
   */
   ccnh_workers = ccn_create();
   res = ccn_connect(ccnh_workers, NULL);
-  if (res < 0) {
+  if (ts_unlikely(res < 0)) {
 #ifdef MLOG
     log->error("ccn_connect error");
 #endif
@@ -1327,7 +1328,7 @@ int main(int argc, char * argv[]) {
   // the client handle, using to connect to local ccnd
   // response for listening
   struct ccn* listening_ccn_h = ccn_create();
-  if (NULL == listening_ccn_h) {
+  if (ts_unlikely(NULL == listening_ccn_h)) {
 #ifdef MLOG
     log->error("ccn_create error");
 #endif
@@ -1335,7 +1336,7 @@ int main(int argc, char * argv[]) {
   }
   
   res = ccn_connect(listening_ccn_h, NULL);
-  if (res < 0) {
+  if (ts_unlikely(res < 0)) {
 #ifdef MLOG
     log->error("ccn_connect error, res = %d", res);
 #endif
@@ -1348,7 +1349,7 @@ int main(int argc, char * argv[]) {
 
   //Convert a ccnx-scheme URI to a ccnb-encoded Name.
   res = ccn_name_from_uri(name, uri_prefix);
-  if (res < 0) {
+  if (ts_unlikely(res < 0)) {
 #ifdef MLOG
     log->error("uri to ccn name failed, uri=%s", uri_prefix);
 #endif
@@ -1362,7 +1363,7 @@ int main(int argc, char * argv[]) {
   
   // Register to receive interests on a prefix
   res = ccn_set_interest_filter(listening_ccn_h, name, &in_interest);
-  if (res < 0) {
+  if (ts_unlikely(res < 0)) {
 #ifdef MLOG
     log->error("ccn_set_interest_filter");
 #endif
@@ -1382,7 +1383,7 @@ int main(int argc, char * argv[]) {
   //receiver/listening pthread
   res = pthread_create(&pts, NULL, waiting_loop, listening_ccn_h); 
 
-  if (res < 0) {
+  if (ts_unlikely(res < 0)) {
 #ifdef MLOG
     log->error("[main] creating thread for interest handler, failed");
 #endif
@@ -1403,18 +1404,18 @@ int main(int argc, char * argv[]) {
 
     //TODO: timeout
     ret = select(maxfd, &rset, NULL, NULL, NULL);
-    if (ret < 1) {
-      if (-1 == ret)
+    if (ts_unlikely(ret < 1)) {
+	if (ts_unlikely(-1 == ret))
 #ifdef MLOG
-        log->error("select() error!");
+	    log->error("select() error!");
 #endif
-      if (0 == ret) { //may not happen
+	if (ts_unlikely(0 == ret)) { //may not happen
 #ifdef MLOG
-        log->warn("select() timeout!");
+	    log->warn("select() timeout!");
 #endif
-      }
+	}
     } else { // ret > 0
-
+	
       // if data received from tun, it could be a local app or interest request
       /* the buffer always starts with an IP header */
       struct iphdr *ip_packet = (struct iphdr *)malloc(MAX_PACKET_SIZE);
@@ -1422,8 +1423,7 @@ int main(int argc, char * argv[]) {
 
       if (FD_ISSET(tun_fd, &rset)) {  // TUN DEVICE is readable
         nread = read(tun_fd, ip_packet, MAX_PACKET_SIZE);
-        if (nread > 0) {
-
+        if (ts_likely(nread > 0)) {
 #ifdef MLOG
           log->info("Received data on tunnel device");
 #endif
@@ -1452,7 +1452,7 @@ int main(int argc, char * argv[]) {
 
           //int worker_id = get_available_worker();
           res = request_interest(ccnh_workers, ip_packet);
-          if (res != 0) {
+          if (ts_unlikely(res != 0)) {
 #ifdef MLOG
             log->warn("sending interest for IP packet failed! res=%d", res);
 #endif

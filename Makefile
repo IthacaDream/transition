@@ -7,6 +7,8 @@ INC = -I./ -I/usr/local/include/
 LIB = -L./ -L/usr/local/lib/  -lccn -lcrypto -llog4cpp -lpthread
 
 CFLAGS = -g $(INC) -fpermissive -DMLOG
+
+#no logs
 #CFLAGS = -g $(INC) -fpermissive
 
 #%.o : %.c

@@ -1,14 +1,10 @@
-// Config.cpp  
-
 #include "config.h"  
 
-using namespace std;  
 
-
-Config::Config( string filename, string delimiter,  
-                string comment )  
+Config::Config( std::string filename, std::string delimiter,  
+                std::string comment )  
     : m_Delimiter(delimiter), m_Comment(comment)  
-{  
+{
   // Construct a Config, getting keys and values from given file  
   
   std::ifstream in( filename.c_str() );  
@@ -20,14 +16,14 @@ Config::Config( string filename, string delimiter,
 
 
 Config::Config()  
-    : m_Delimiter( string(1,'=') ), m_Comment( string(1,'#') )  
+    : m_Delimiter( std::string(1,'=') ), m_Comment( std::string(1,'#') )  
 {  
   // Construct a Config without a file; empty  
 }  
 
 
 
-bool Config::KeyExists( const string& key ) const  
+bool Config::KeyExists( const std::string& key ) const  
 {  
   // Indicate whether key is found  
   mapci p = m_Contents.find( key );  
@@ -36,7 +32,7 @@ bool Config::KeyExists( const string& key ) const
       
 
 /* static */  
-void Config::Trim( string& inout_s )  
+void Config::Trim( std::string& inout_s )  
 {  
   // Remove leading and trailing whitespace  
   static const char whitespace[] = " \n\t\v\r\f";  
@@ -58,7 +54,7 @@ std::ostream& operator<<( std::ostream& os, const Config& cf )
   return os;  
 }  
 
-void Config::Remove( const string& key )  
+void Config::Remove( const std::string& key )  
 {  
   // Remove key and its value  
   m_Contents.erase( m_Contents.find( key ) );  
@@ -69,17 +65,17 @@ std::istream& operator>>( std::istream& is, Config& cf )
 {  
   // Load a Config from is  
   // Read in keys and values, keeping internal whitespace  
-  typedef string::size_type pos;  
-  const string& delim  = cf.m_Delimiter;  // separator  
-  const string& comm   = cf.m_Comment;    // comment  
+  typedef std::string::size_type pos;  
+  const std::string& delim  = cf.m_Delimiter;  // separator  
+  const std::string& comm   = cf.m_Comment;    // comment  
   const pos skip = delim.length();        // length of separator  
   
-  string nextline = "";  // might need to read ahead to see where value ends  
+  std::string nextline = "";  // might need to read ahead to see where value ends  
   
   while( is || nextline.length() > 0 )  
   {  
     // Read an entire line at a time  
-    string line;  
+    std::string line;  
     if( nextline.length() > 0 )  
     {  
       line = nextline;  // we read ahead; use it now  
@@ -95,10 +91,10 @@ std::istream& operator>>( std::istream& is, Config& cf )
     
     // Parse the line if it contains a delimiter  
     pos delimPos = line.find( delim );  
-    if( delimPos < string::npos )  
+    if( delimPos < std::string::npos )  
     {  
       // Extract the key  
-      string key = line.substr( 0, delimPos );  
+      std::string key = line.substr( 0, delimPos );  
       line.replace( 0, delimPos+skip, "" );  
       
       // See if value continues on the next line  
@@ -110,12 +106,12 @@ std::istream& operator>>( std::istream& is, Config& cf )
         std::getline( is, nextline );  
         terminate = true;  
         
-        string nlcopy = nextline;  
+        std::string nlcopy = nextline;  
         Config::Trim(nlcopy);  
         if( nlcopy == "" ) continue;  
         
         nextline = nextline.substr( 0, nextline.find(comm) );  
-        if( nextline.find(delim) != string::npos )  
+        if( nextline.find(delim) != std::string::npos )  
           continue;  
         
         nlcopy = nextline;  
@@ -143,8 +139,8 @@ bool Config::FileExist(std::string filename)
   return exist;  
 }  
 
-void Config::ReadFile( string filename, string delimiter,  
-                       string comment )  
+void Config::ReadFile( std::string filename, std::string delimiter,  
+                       std::string comment )  
 {  
   m_Delimiter = delimiter;  
   m_Comment = comment;  
