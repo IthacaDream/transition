@@ -72,7 +72,7 @@ int g_log_id;
 struct settings g_setting;
 
 #ifdef MLOG
-log4cpp::Category *log;            // logging
+  log4cpp::Category *log;            // logging
 #endif
 
 FILE* DF = -1;
