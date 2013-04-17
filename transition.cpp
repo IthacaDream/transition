@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <signal.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
@@ -75,7 +76,7 @@ struct settings g_setting;
   log4cpp::Category *log;            // logging
 #endif
 
-FILE* DF = -1;
+FILE* DF = NULL;
 int g_seq;
 /* @describe: shutdown log before exit
  * @param:    rc
@@ -84,8 +85,8 @@ void safe_exit(int rc) {
 #ifdef MLOG
   log4cpp::Category::shutdown();
 #endif
-  if ( DF != -1)
-    close (DF);
+  if ( DF )
+   fclose (DF);
   exit(rc);
 }
 
@@ -644,7 +645,7 @@ void* get_return_uri(const char *uri, char* ret_uri, int* length) {
 /* overloading version for IP
  * very simple
  */
-char *get_return_uri(const char *uri) {
+void *get_return_uri(const char *uri) {
   int numCompsFound = 0;
   int i;
   int uriLen = strlen(uri);
@@ -1233,8 +1234,22 @@ void handle_send(int id, struct iphdr *ip_pkt) {
 }
 */
 
+static void sig_term(int x) {
+  //do sth.
+  safe_exit(x);
+}
 
 int main(int argc, char * argv[]) {
+
+  //signal handle
+  signal(SIGPIPE, SIG_IGN);
+  signal(SIGTERM, sig_term);
+  signal(SIGKILL, sig_term);
+  signal(SIGINT, sig_term);
+  signal(SIGSEGV, sig_term);
+  signal(SIGABRT, sig_term);
+  //end
+  
   int i, res;
   char tun_name[IFNAMSIZ]; // 16
   char *buffer = NULL;
