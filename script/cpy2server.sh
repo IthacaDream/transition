@@ -15,7 +15,7 @@ REMOTE_DIR="$2"
 USER="$3"
 
 #servers
-SERVERS=("192.168.4.12" "192.168.4.10" "192.168.4.11")
+SERVERS=("219.223.192.70" "219.223.195.68" "219.223.195.140")
 
 [ -n "$1" ] || WORK_DIR="."
 [ -n "$2" ] || REMOTE_DIR="~/work/transition/"
@@ -27,8 +27,8 @@ echo "user: ${USER}"
 
 for svr in ${SERVERS[@]}
 do
-    echo scp -r $WORK_DIR ${USER}@${srv}:$REMOTE_DIR
+    echo "scp -r $WORK_DIR ${USER}@${svr}:$REMOTE_DIR"
     scp -r $WORK_DIR ${USER}@${svr}:$REMOTE_DIR
-    echo "cp to server $s, DONE"
+    echo "cp to server $svr, DONE"
 done
 echo "all done"
