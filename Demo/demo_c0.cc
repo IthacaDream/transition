@@ -53,8 +53,8 @@ int main()
   
   ccn_charbuf_destroy(&name);
   
-  const unsigned char *ptr = resultbuf->buf;
-  size_t length = resultbuf->length;
+  const unsigned char *ptr = NULL;
+  size_t length = 0;
   
   res = ccn_content_get_value(resultbuf->buf, resultbuf->length,
                               &pcobuf, &ptr, &length);
