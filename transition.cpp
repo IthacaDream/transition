@@ -1336,6 +1336,7 @@ int main(int argc, char * argv[]) {
 #ifdef MLOG
     log->error("ccn_connect error");
 #endif
+    ccn_destroy(&ccnh_workers);
     safe_exit(1);
   }
   
@@ -1402,7 +1403,6 @@ int main(int argc, char * argv[]) {
 #ifdef MLOG
     log->error("[main] creating thread for interest handler, failed");
 #endif
-    ccn_destroy(&listening_ccn_h);
     ccn_destroy(&listening_ccn_h);
     safe_exit(1);
   }
